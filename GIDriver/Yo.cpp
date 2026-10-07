@@ -1,3 +1,5 @@
+// https://yougame.biz/threads/393246/
+
 #include <ntifs.h>
 #include <ntimage.h>
 
