@@ -6,6 +6,16 @@
 #define LOG_INFO(fmt, ...) DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[+] " fmt "\n", __VA_ARGS__)
 #define LOG_ERR(fmt,  ...) DbgPrintEx( DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "[-] " fmt "\n", __VA_ARGS__)
 
+extern "C" NTSTATUS NTAPI MmCopyVirtualMemory(
+    PEPROCESS SourceProcess,
+    PVOID SourceAddress,
+    PEPROCESS TargetProcess,
+    PVOID TargetAddress,
+    SIZE_T BufferSize,
+    KPROCESSOR_MODE PreviousMode,
+    PSIZE_T ReturnSize);
+extern "C" PVOID PsGetProcessSectionBaseAddress(PEPROCESS Process);
+
 UNICODE_STRING HoYoKProtect_suffix = RTL_CONSTANT_STRING(L"HoYoKProtect.sys");
 UNICODE_STRING mhypbase_suffix = RTL_CONSTANT_STRING(L"mhypbase.dll");
 UNICODE_STRING flushBuffer_suffix = RTL_CONSTANT_STRING(L"ZwFlushWriteBuffer");
@@ -26,6 +36,8 @@ typedef struct _OB_CONTEXT {
     PVOID  Dispatcher;
     ULONG  InitFlags;
 } OB_CONTEXT, * POB_CONTEXT;
+
+static struct z {PEPROCESS process; PVOID imageBase;}g_z;
 
 NTSTATUS RedirectNameSlot(PVOID Base, ULONG Rva, const VOID* Value, ULONG Size, KPROCESSOR_MODE Mode)
 {
@@ -58,98 +70,108 @@ NTSTATUS RedirectNameSlot(PVOID Base, ULONG Rva, const VOID* Value, ULONG Size, 
 }
 
 VOID unhide(PVOID Ctx) {
-    PEPROCESS proc = static_cast<PEPROCESS>(Ctx);
-    LARGE_INTEGER tick{};
-    tick.QuadPart = -2000000;
+    auto proc = static_cast<z*>(Ctx);
+    const PEPROCESS process = proc->process;
+    const PVOID imageBase = proc->imageBase;
+    LARGE_INTEGER tickTh{};
+    tickTh.QuadPart = -2000000;
 
+    LARGE_INTEGER tickMhy{};
+    tickMhy.QuadPart = -10000;
 
-    UNICODE_STRING fn = RTL_CONSTANT_STRING(L"ZwGetNextThread");
-    const auto getNextThread = reinterpret_cast<NTSTATUS(*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE)>(MmGetSystemRoutineAddress(&fn));
-    HANDLE hProc = nullptr;
-    if (getNextThread == nullptr || !NT_SUCCESS(ObOpenObjectByPointer(proc, OBJ_KERNEL_HANDLE, nullptr, PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &hProc)))
+    if (imageBase != nullptr)
     {
-        LOG_ERR("Unhide init failed");
-        ObDereferenceObject(proc);
-        PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
-        return;
+        char* flagAddress = (char*)((PUCHAR)imageBase + mhypFlag);
+
+        KAPC_STATE apcState;
+        KeStackAttachProcess(process, &apcState);
+
+        __try
+        {
+            for (;;)
+            {
+                if (PsGetProcessExitStatus(process) != STATUS_PENDING) break;
+                if (InterlockedCompareExchange8(flagAddress, 0, 1) == 1)
+                {
+                    KeMemoryBarrier();
+                    LOG_INFO("Mhypbase flag address %p changed!", flagAddress);
+                    break;
+                }
+                KeDelayExecutionThread(KernelMode, FALSE, &tickMhy);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            LOG_ERR("Mhypbase flag access failed: 0x%08X", GetExceptionCode());
+        }
+        KeUnstackDetachProcess(&apcState);
     }
 
+    LONG off = -1;
     PETHREAD self = PsGetCurrentThread();
     UCHAR sn[0x600];
     RtlCopyMemory(sn, self, sizeof(sn));
     ZwSetInformationThread(NtCurrentThread(), ThreadHideFromDebugger, nullptr, 0);
 
-    LONG off = -1;
     for (ULONG i = 0; i + 4 <= sizeof(sn); i += 4)
     {
         if ((*(PULONG)(sn + i) ^ *(volatile PULONG)(reinterpret_cast<PUCHAR>(self) + i)) == 0x4)
         {
-            off = static_cast<LONG>(i);
-            break;
+            off = static_cast<LONG>(i); break;
         }
     }
+
     if (off < 0)
     {
-        LOG_ERR("CrossThreadFlags offset not found");
-        ObDereferenceObject(proc);
+        ObDereferenceObject(process);
         PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
         return;
     }
-    LOG_INFO("CrossThreadFlags offset 0x%X", static_cast<ULONG>(off));
 
-    ULONG empty = 0;
+    UNICODE_STRING fn = RTL_CONSTANT_STRING(L"ZwGetNextThread");
+    const auto getNextThread = reinterpret_cast<NTSTATUS(*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE)>(MmGetSystemRoutineAddress(&fn));
+
+    HANDLE hProc = nullptr;
+    if (getNextThread == nullptr || !NT_SUCCESS(ObOpenObjectByPointer(process, OBJ_KERNEL_HANDLE, nullptr, PROCESS_ALL_ACCESS, *PsProcessType, KernelMode, &hProc)))
+    {
+        ObDereferenceObject(process);
+        PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
+        return;
+    }
+
     for (;;)
     {
-        KeDelayExecutionThread(KernelMode, FALSE, &tick);
-        BOOLEAN found = FALSE;
-        HANDLE prev = nullptr;
-        for (;;)
-        {
-            HANDLE h = nullptr;
-            if (!NT_SUCCESS(getNextThread(hProc, prev, THREAD_QUERY_LIMITED_INFORMATION, OBJ_KERNEL_HANDLE, 0, &h))) break;
+        if (PsGetProcessExitStatus(process) != STATUS_PENDING) break;
+
+        HANDLE prevThread = nullptr;
+        HANDLE currThread = nullptr;
+
+        while (NT_SUCCESS(getNextThread(hProc, prevThread, THREAD_QUERY_LIMITED_INFORMATION, OBJ_KERNEL_HANDLE, 0, &currThread))) {
             PETHREAD th = nullptr;
-            if (NT_SUCCESS(ObReferenceObjectByHandle(h, 0, *PsThreadType, KernelMode, reinterpret_cast<PVOID*>(&th), nullptr)) && th != nullptr)
+
+            if (NT_SUCCESS(ObReferenceObjectByHandle(currThread, 0, *PsThreadType, KernelMode, reinterpret_cast<PVOID*>(&th), nullptr)) && th != nullptr)
             {
-                found = TRUE;
-                *(volatile PULONG)(reinterpret_cast<PUCHAR>(th) + off) &= ~4u;
+                *(volatile PULONG)(reinterpret_cast<PUCHAR>(th) + off) &= ~4u; 
                 ObDereferenceObject(th);
             }
-            if (prev != nullptr) ZwClose(prev);
-            prev = h;
+
+            if (prevThread != nullptr) ZwClose(prevThread);
+            prevThread = currThread;
         }
-        if (prev != nullptr) ZwClose(prev);
-        empty = found ? 0 : empty + 1;
-        if (empty >= 150) break;
+        if (prevThread != nullptr) ZwClose(prevThread);
+
+        KeDelayExecutionThread(KernelMode, FALSE, &tickTh);
     }
+
     ZwClose(hProc);
-    ObDereferenceObject(proc);
+    ObDereferenceObject(process);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-VOID HoYoImageLoad(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
+VOID ImageLoad(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo);
 VOID EnabledProtect(PVOID ImageBase)
 {
     LARGE_INTEGER tick{};
     tick.QuadPart = -10000;
-
-    const auto dos = static_cast<PIMAGE_DOS_HEADER>(ImageBase);
-    const auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(static_cast<PUCHAR>(ImageBase) + dos->e_lfanew);
-
-    if (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) // mhypbase: byte_bleh 1->0
-    {
-        const auto flag = static_cast<PUCHAR>(ImageBase) + mhypFlag;
-        __try {
-            while (*flag != 1) KeDelayExecutionThread(KernelMode, FALSE, &tick);
-
-            *flag = 0;
-            LOG_INFO("Mhypbase flag address %p changed!", flag);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            LOG_ERR("Mhypbase flag access failed: 0x%08X", GetExceptionCode());
-        }
-        PsTerminateSystemThread(STATUS_SUCCESS);
-        return;
-    }
 
     // HoYoKProtect: POB_CONTEXT Enabled 1->0
     const auto ctx = reinterpret_cast<POB_CONTEXT>(static_cast<PUCHAR>(ImageBase) + context);
@@ -162,32 +184,31 @@ VOID EnabledProtect(PVOID ImageBase)
     __except (EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERR("Access failed: 0x%08X", GetExceptionCode());
     }
-    PsRemoveLoadImageNotifyRoutine(HoYoImageLoad);
+    PsRemoveLoadImageNotifyRoutine(ImageLoad);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 
-VOID HoYoImageLoad(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
+VOID ImageLoad(PUNICODE_STRING FullImageName, HANDLE ProcessId, PIMAGE_INFO ImageInfo)
 {
     ProcessId;
 
     if (ImageInfo == nullptr || ImageInfo->ImageBase == nullptr || FullImageName == nullptr || FullImageName->Buffer == nullptr) return;
-
     if (!ImageInfo->SystemModeImage && FullImageName != nullptr && FullImageName->Buffer != nullptr && RtlSuffixUnicodeString(&mhypbase_suffix, FullImageName, TRUE))
     {
         LOG_INFO("Mhypbase.dll base=%p size=0x%lX", ImageInfo->ImageBase, static_cast<ULONG>(ImageInfo->ImageSize));
 
-        PEPROCESS proc = PsGetCurrentProcess();
-        ObReferenceObject(proc);
-        HANDLE swthread = nullptr;
-        NTSTATUS st = PsCreateSystemThread(&swthread, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, unhide, proc);
-        if (NT_SUCCESS(st)) ZwClose(swthread);
-        else { LOG_ERR("Unhide thread failed: 0x%08X", st); ObDereferenceObject(proc); }
 
-        HANDLE thread = nullptr;
-        st = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, nullptr, ZwCurrentProcess(), nullptr, EnabledProtect, ImageInfo->ImageBase);
-        if (NT_SUCCESS(st)) ZwClose(thread);
-        else LOG_ERR("Mhypbase thread failed: 0x%08X", st);
+        // mhypbase flag 1->0
+        if (NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &g_z.process)))
+        {
+            g_z.imageBase = ImageInfo->ImageBase;
+
+            HANDLE swthread = nullptr;
+            NTSTATUS st = PsCreateSystemThread(&swthread, THREAD_ALL_ACCESS, nullptr, nullptr, nullptr, unhide, &g_z);
+            if (NT_SUCCESS(st)) ZwClose(swthread);
+            else { ObDereferenceObject(g_z.process); LOG_ERR("Mhypbase thread failed: 0x%08X", st); }
+        }
     }
 
     if (ImageInfo->SystemModeImage && RtlSuffixUnicodeString(&HoYoKProtect_suffix, FullImageName, TRUE))
@@ -223,7 +244,7 @@ extern "C" NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING Reg
     DriverObject;
     RegistryPath;
 
-    NTSTATUS status = PsSetLoadImageNotifyRoutine(HoYoImageLoad);
+    NTSTATUS status = PsSetLoadImageNotifyRoutine(ImageLoad);
     if (!NT_SUCCESS(status)) {
         LOG_ERR("PsSetLoadImageNotifyRoutine failed: 0x%08X", status);
         return status;
